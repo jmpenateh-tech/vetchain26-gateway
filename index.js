@@ -1,5 +1,6 @@
 import express from "express";
 import cors from "cors";
+import crypto from "crypto";
 import { resolveSecret, verifyToken, bearer } from "./jwt.js";
 
 const app = express();
@@ -28,9 +29,18 @@ if (IS_PRODUCTION && corsOpen) {
   );
   process.exit(1);
 }
+app.disable("x-powered-by");
+// TRUST_PROXY = número de proxies delante del gateway (Render: 1). Así req.ip es la IP
+// real del cliente para el límite de intentos de login. Local: 0 (sin proxy).
+app.set("trust proxy", Number(process.env.TRUST_PROXY) || 0);
+app.use((_req, res, next) => {
+  // Cabeceras de seguridad básicas para las respuestas JSON de la API.
+  res.set({ "X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY", "Referrer-Policy": "no-referrer", "Cache-Control": "no-store" });
+  next();
+});
 app.use(cors(corsOpen ? undefined : { origin: corsOrigins }));
 console.log(`[gateway] CORS: ${corsOpen ? "abierto (desarrollo)" : corsOrigins.join(", ")}`);
-app.use(express.json());
+app.use(express.json({ limit: "2mb" }));
 
 // Render Blueprints (fromService/property: hostport) inyectan solo "host:port",
 // sin esquema. En Docker Compose las variables ya traen "http://..." completo,
@@ -84,6 +94,8 @@ async function proxy(base, path, req, res) {
   try {
     const headers = { "Content-Type": "application/json" };
     if (req.headers.authorization) headers.Authorization = req.headers.authorization;
+    // 2.8: IP del cliente para la auditoría (los servicios ven al gateway como origen).
+    headers["X-Forwarded-For"] = req.ip || "";
     // Identidad ya verificada por el gateway, por si un servicio la necesita.
     if (req.user) {
       headers["X-User-Id"] = String(req.user.sub);
@@ -113,7 +125,98 @@ async function proxy(base, path, req, res) {
 }
 
 // -----------------------------------------------------------------------------
-// Autorización (VetChain 2.4)
+// Auditoría (VetChain 2.8): el gateway anota lo que rechaza él mismo (token no
+// válido, rol sin permiso, rutas manipuladas, IP bloqueada). Los eventos van
+// firmados con HMAC (JWT_SECRET) a POST /internal/audit de auth-service.
+// -----------------------------------------------------------------------------
+const AUDIT_MAX_PER_MIN = Number(process.env.AUDIT_MAX_PER_MIN) || 300;
+let auditWindow = { start: Date.now(), n: 0 };
+function sendAudit(req, ev) {
+  if (Date.now() - auditWindow.start > 60_000) auditWindow = { start: Date.now(), n: 0 };
+  if (++auditWindow.n > AUDIT_MAX_PER_MIN) return;
+  const body = JSON.stringify({
+    service: "gateway", ip: req.ip, method: req.method, path: req.originalUrl.split("?")[0],
+    actor_id: req.user?.sub ?? null, actor_name: req.user?.name || null, actor_role: req.user?.role || null, ...ev,
+  });
+  const ts = String(Date.now());
+  const sig = crypto.createHmac("sha256", JWT_SECRET).update(`${ts}.${body}`).digest("hex");
+  fetch(`${services.auth}/internal/audit`, {
+    method: "POST", headers: { "Content-Type": "application/json", "X-Audit-Ts": ts, "X-Audit-Signature": sig },
+    body, signal: AbortSignal.timeout(5000),
+  }).catch((e) => console.error("[gateway] no se pudo enviar el evento de auditoría:", e.message));
+}
+
+// -----------------------------------------------------------------------------
+// Vigencia de la sesión (VetChain 2.7, A3)
+// Además de la firma, el gateway pregunta a auth-service si el token sigue vigente
+// (cuenta activa, mismo rol, misma versión de sesión). La respuesta se guarda
+// SESSION_CACHE_MS (30 s): un token revocado deja de funcionar en ese plazo.
+// -----------------------------------------------------------------------------
+const SESSION_CACHE_MS = Number(process.env.SESSION_CACHE_MS) || 30000;
+const sessionCache = new Map();
+async function checkSession(token) {
+  const key = token.slice(-43);
+  const hit = sessionCache.get(key);
+  if (hit && hit.until > Date.now()) return hit.result;
+  let result;
+  try {
+    const r = await fetch(`${services.auth}/session`, {
+      headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(PROXY_TIMEOUT_MS),
+    });
+    if (r.ok) result = { ok: true };
+    else if (r.status === 401 || r.status === 403) {
+      const d = await r.json().catch(() => ({}));
+      result = { ok: false, status: 401, error: d.error || "Tu sesión ya no es válida. Inicia sesión de nuevo.", code: d.code || "session_revoked" };
+    } else throw new Error(`HTTP ${r.status}`);
+  } catch (e) {
+    console.error("[gateway] no se pudo validar la sesión:", e.message);
+    return { ok: false, status: 503, error: "No se pudo validar la sesión. Intenta de nuevo en unos segundos." };
+  }
+  if (sessionCache.size > 5000) sessionCache.clear();
+  sessionCache.set(key, { result, until: Date.now() + SESSION_CACHE_MS });
+  return result;
+}
+
+// -----------------------------------------------------------------------------
+// Límite de intentos fallidos de login por IP (VetChain 2.7, A2)
+// auth-service limita por cuenta; aquí se limita por IP para frenar a quien prueba
+// muchas cuentas distintas. Solo cuentan los intentos fallidos (401/429), así un
+// grupo detrás de la misma IP (p. ej. la red de la universidad) no se bloquea al
+// entrar con normalidad.
+// -----------------------------------------------------------------------------
+const IP_MAX_FAILURES = Number(process.env.LOGIN_IP_MAX_FAILURES) || 30;
+const IP_WINDOW_MS = (Number(process.env.LOGIN_WINDOW_MINUTES) || 15) * 60_000;
+const ipFailures = new Map();
+function ipLockedMs(ip) {
+  const f = ipFailures.get(ip);
+  if (!f) return 0;
+  const left = f.first + IP_WINDOW_MS - Date.now();
+  if (left <= 0) { ipFailures.delete(ip); return 0; }
+  return f.count >= IP_MAX_FAILURES ? left : 0;
+}
+function ipFailure(ip) {
+  const f = ipFailures.get(ip);
+  if (!f || f.first + IP_WINDOW_MS <= Date.now()) ipFailures.set(ip, { count: 1, first: Date.now() });
+  else f.count++;
+  if (ipFailures.size > 20000) ipFailures.clear();
+}
+app.use("/auth/login", (req, res, next) => {
+  if (req.method !== "POST") return next();
+  const ip = req.ip || "desconocida";
+  const left = ipLockedMs(ip);
+  if (left) {
+    sendAudit(req, { action: "login.ip_blocked", outcome: "blocked", severity: "critical", target: ip,
+      message: `Inicio de sesión bloqueado: ${IP_MAX_FAILURES} intentos fallidos desde esta IP` });
+    res.set("Retry-After", String(Math.ceil(left / 1000)));
+    return res.status(429).json({ error: `Demasiados intentos fallidos desde esta conexión. Espera ${Math.ceil(left / 60000)} minuto(s).`, code: "too_many_attempts" });
+  }
+  res.on("finish", () => { if (res.statusCode === 401 || res.statusCode === 429) ipFailure(ip); });
+  next();
+});
+
+// -----------------------------------------------------------------------------
+// Autorización (VetChain 2.4, ampliada en 2.7)
 // Todas las rutas de negocio exigen un token válido (Authorization: Bearer ...),
 // salvo el login. Las operaciones de escritura solo las puede hacer el rol que
 // las ejecuta en la cadena real. Cualquier escritura que no esté en la lista se
@@ -122,36 +225,69 @@ async function proxy(base, path, req, res) {
 const PUBLIC_ROUTES = [["POST", /^\/auth\/login\/?$/], ["POST", /^\/auth\/register\/?$/]];
 const WRITE_RULES = [
   // [métodos, ruta, roles permitidos]
-  [["POST", "PATCH"], /^\/auth\/users(\/|$)/, ["admin"]],
+  [["POST", "PATCH", "DELETE"], /^\/auth\/users(\/|$)/, ["admin"]],
   [["POST"], /^\/auth\/me\/password\/?$/, ["admin", "fabricante", "distribuidor", "veterinaria"]],
+  // 2.8: foto de perfil propia
+  [["POST", "DELETE"], /^\/auth\/me\/photo\/?$/, ["admin", "fabricante", "distribuidor", "veterinaria"]],
   [["POST"], /^\/manufacturing\/batches(\/|$)/, ["fabricante"]],
-  [["POST"], /^\/recall\/recalls\/?$/, ["fabricante"]],
+  [["POST"], /^\/recall\/recalls\/?$/, ["fabricante", "admin"]],
   [["POST", "PATCH"], /^\/distribution\/(shipments|custody-transfers)(\/|$)/, ["distribuidor"]],
   [["POST"], /^\/dispensing\/dispensations\/?$/, ["veterinaria"]],
   [["PATCH"], /^\/fraud\/fraud-alerts\/[^/]+\/?$/, ["admin"]],
 ];
 const READ_RULES = [
   [/^\/auth\/users(\/|$)/, ["admin"]],
+  [/^\/auth\/audit(\/|$)/, ["admin"]], // 2.8: registro de auditoría
+  // 2.7 (M1): alertas de fraude, analítica y plantillas solo para el administrador.
+  [/^\/fraud(\/|$)/, ["admin"]],
+  [/^\/analytics(\/|$)/, ["admin"]],
+  [/^\/notifications\/templates(\/|$)/, ["admin"]],
 ];
 
-function authorize(req, res, next) {
-  const path = req.path;
+async function authorize(req, res, next) {
+  // Ruta normalizada: sin distinguir mayúsculas y sin barras dobles, igual que la
+  // interpreta Express al enrutar. Una ruta con "." o ".." como segmento se rechaza:
+  // el gateway reenvía la ruta original y fetch las resolvería de otra forma.
+  let path;
+  const badPath = () => {
+    sendAudit(req, { action: "request.path_rejected", outcome: "denied", severity: "critical", message: "Ruta manipulada (codificación o segmentos . / ..)" });
+    return res.status(400).json({ error: "Ruta no válida" });
+  };
+  try { path = decodeURIComponent(req.path).toLowerCase().replace(/\/{2,}/g, "/"); }
+  catch { return badPath(); }
+  if (/(^|\/)\.{1,2}(\/|$)/.test(path)) return badPath();
   const method = req.method;
   if (method === "OPTIONS") return next();
   if (PUBLIC_ROUTES.some(([m, re]) => m === method && re.test(path))) return next();
 
-  const user = verifyToken(bearer(req), JWT_SECRET);
-  if (!user) return res.status(401).json({ error: "Sesión no válida o expirada. Inicia sesión de nuevo." });
+  const token = bearer(req);
+  const user = verifyToken(token, JWT_SECRET);
+  if (!user) {
+    // Token caducado: algo normal. Token ausente o falsificado: se anota.
+    const expired = token && /^[\w-]+\.[\w-]+\.[\w-]+$/.test(token) && (() => { try { const p = JSON.parse(Buffer.from(token.split(".")[1], "base64url")); return p.exp < Date.now() / 1000; } catch { return false; } })();
+    if (!expired) sendAudit(req, { action: "access.unauthenticated", outcome: "denied", severity: token ? "critical" : "warning",
+      message: token ? "Token no válido o manipulado" : "Petición sin sesión" });
+    return res.status(401).json({ error: "Sesión no válida o expirada. Inicia sesión de nuevo." });
+  }
+  const session = await checkSession(token);
+  if (!session.ok) return res.status(session.status).json({ error: session.error, ...(session.code ? { code: session.code } : {}) });
   req.user = user;
 
   if (method === "GET" || method === "HEAD") {
     const rule = READ_RULES.find(([re]) => re.test(path));
-    if (rule && !rule[1].includes(user.role)) return res.status(403).json({ error: "Tu rol no tiene acceso a esta información" });
+    if (rule && !rule[1].includes(user.role)) {
+      sendAudit(req, { action: "access.denied", outcome: "denied", severity: "warning", message: "Rol sin acceso a esta información" });
+      return res.status(403).json({ error: "Tu rol no tiene acceso a esta información" });
+    }
     return next();
   }
   const rule = WRITE_RULES.find(([methods, re]) => methods.includes(method) && re.test(path));
-  if (!rule) return res.status(403).json({ error: "Operación no permitida" });
+  if (!rule) {
+    sendAudit(req, { action: "access.denied", outcome: "denied", severity: "critical", message: "Operación de escritura no permitida por el gateway" });
+    return res.status(403).json({ error: "Operación no permitida" });
+  }
   if (!rule[2].includes(user.role)) {
+    sendAudit(req, { action: "access.denied", outcome: "denied", severity: "warning", message: "Rol sin permiso para esta acción" });
     return res.status(403).json({ error: "Tu rol no tiene permiso para esta acción" });
   }
   next();
