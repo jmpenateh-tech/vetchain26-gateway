@@ -58,6 +58,8 @@ const services = {
   recall: withScheme(process.env.RECALL_URL || "localhost:3007"),
   notification: withScheme(process.env.NOTIFICATION_URL || "localhost:3008"),
   analytics: withScheme(process.env.ANALYTICS_URL || "localhost:3009"),
+  // 2.10: mensajería interna usuario ↔ administrador
+  communication: withScheme(process.env.COMMUNICATION_URL || "localhost:3010"),
 };
 
 app.get("/", (_, res) =>
@@ -90,7 +92,15 @@ app.get("/health", async (req, res) => {
   res.json(result);
 });
 
+// 2.10: además de JSON, el gateway reenvía
+//   - archivos (p. ej. los reportes PDF): se copian Content-Type y Content-Disposition;
+//   - flujos de eventos (text/event-stream) del chat, sin límite de tiempo y cerrando la
+//     conexión con el microservicio cuando el navegador se desconecta.
+const STREAM_PATHS = [/^\/chat\/stream(\?|$)/];
 async function proxy(base, path, req, res) {
+  const streaming = STREAM_PATHS.some((re) => re.test(path));
+  const ctrl = new AbortController();
+  if (streaming) res.on("close", () => ctrl.abort());
   try {
     const headers = { "Content-Type": "application/json" };
     if (req.headers.authorization) headers.Authorization = req.headers.authorization;
@@ -108,15 +118,34 @@ async function proxy(base, path, req, res) {
       method: req.method,
       headers,
       body: hasBody ? JSON.stringify(req.body) : undefined,
-      signal: AbortSignal.timeout(PROXY_TIMEOUT_MS),
+      signal: streaming ? ctrl.signal : AbortSignal.timeout(PROXY_TIMEOUT_MS),
     });
 
+    const type = r.headers.get("content-type") || "";
+    if (type.includes("text/event-stream") && r.body) {
+      res.status(r.status).set({ "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-store", "X-Accel-Buffering": "no", Connection: "keep-alive" });
+      res.flushHeaders?.();
+      try { for await (const chunk of r.body) res.write(chunk); } catch { /* el navegador cerró la conexión */ }
+      return res.end();
+    }
+    if (type && !type.includes("application/json")) {
+      const buf = Buffer.from(await r.arrayBuffer());
+      const pass = { "Content-Type": type, "Content-Length": String(buf.length) };
+      const disp = r.headers.get("content-disposition");
+      if (disp) pass["Content-Disposition"] = disp;
+      const partial = r.headers.get("x-report-partial");
+      if (partial) pass["X-Report-Partial"] = partial;
+      pass["Access-Control-Expose-Headers"] = "Content-Disposition, X-Report-Partial";
+      return res.status(r.status).set(pass).end(buf);
+    }
     const text = await r.text();
     let data;
     try { data = JSON.parse(text); } catch { data = { message: text }; }
     res.status(r.status).json(data);
   } catch (e) {
+    if (streaming && ctrl.signal.aborted) return; // el navegador cerró el flujo del chat
     console.error("Gateway proxy error:", e.message);
+    if (res.headersSent) return res.end();
     if (e.name === "TimeoutError") {
       return res.status(504).json({ error: "El microservicio tardó demasiado en responder" });
     }
@@ -223,25 +252,48 @@ app.use("/auth/login", (req, res, next) => {
 // rechaza (lista blanca).
 // -----------------------------------------------------------------------------
 const PUBLIC_ROUTES = [["POST", /^\/auth\/login\/?$/], ["POST", /^\/auth\/register\/?$/]];
+// 2.10: jerarquía de administración. ADMINS = admin y master-admin; las rutas exclusivas
+// del administrador general usan MASTER. Esta lista es la primera barrera: cada servicio
+// vuelve a comprobar el rol Y el ámbito (qué usuarios/datos le corresponden a cada admin).
+const MASTER = ["master-admin"];
+const ADMINS = ["master-admin", "admin"];
+const EVERYONE = ["master-admin", "admin", "fabricante", "distribuidor", "veterinaria"];
 const WRITE_RULES = [
   // [métodos, ruta, roles permitidos]
-  [["POST", "PATCH", "DELETE"], /^\/auth\/users(\/|$)/, ["admin"]],
-  [["POST"], /^\/auth\/me\/password\/?$/, ["admin", "fabricante", "distribuidor", "veterinaria"]],
+  [["PUT"], /^\/auth\/users\/[^/]+\/admin\/?$/, MASTER],
+  [["POST"], /^\/auth\/admins\/[^/]+\/reassign-users\/?$/, MASTER],
+  [["POST", "PATCH", "DELETE"], /^\/auth\/users(\/|$)/, ADMINS],
+  [["POST"], /^\/auth\/me\/password\/?$/, EVERYONE],
   // 2.8: foto de perfil propia
-  [["POST", "DELETE"], /^\/auth\/me\/photo\/?$/, ["admin", "fabricante", "distribuidor", "veterinaria"]],
+  [["POST", "DELETE"], /^\/auth\/me\/photo\/?$/, EVERYONE],
   [["POST"], /^\/manufacturing\/batches(\/|$)/, ["fabricante"]],
-  [["POST"], /^\/recall\/recalls\/?$/, ["fabricante", "admin"]],
+  // 3.0: catálogo de productos. El fabricante envía y corrige SUS solicitudes; solo la
+  // administración (gerente con ámbito o Administrador) aprueba o rechaza. El servicio
+  // vuelve a comprobar rol, propiedad, ámbito y estado.
+  [["POST"], /^\/manufacturing\/products\/[^/]+\/(approve|reject)\/?$/, ADMINS],
+  [["POST"], /^\/manufacturing\/products\/?$/, ["fabricante"]],
+  [["PUT"], /^\/manufacturing\/products\/[^/]+\/?$/, ["fabricante"]],
+  [["POST"], /^\/recall\/recalls\/?$/, ["fabricante", ...ADMINS]],
   [["POST", "PATCH"], /^\/distribution\/(shipments|custody-transfers)(\/|$)/, ["distribuidor"]],
   [["POST"], /^\/dispensing\/dispensations\/?$/, ["veterinaria"]],
-  [["PATCH"], /^\/fraud\/fraud-alerts\/[^/]+\/?$/, ["admin"]],
+  [["PATCH"], /^\/fraud\/fraud-alerts\/[^/]+\/?$/, ADMINS],
+  // 2.10: chat (el servicio decide con quién puede hablar cada cuenta)
+  [["POST", "PATCH"], /^\/chat\/(conversations|messages)(\/|$)/, EVERYONE],
 ];
 const READ_RULES = [
-  [/^\/auth\/users(\/|$)/, ["admin"]],
-  [/^\/auth\/audit(\/|$)/, ["admin"]], // 2.8: registro de auditoría
-  // 2.7 (M1): alertas de fraude, analítica y plantillas solo para el administrador.
-  [/^\/fraud(\/|$)/, ["admin"]],
-  [/^\/analytics(\/|$)/, ["admin"]],
-  [/^\/notifications\/templates(\/|$)/, ["admin"]],
+  // 3.0: catálogo. Listas propias del fabricante; cola de solicitudes solo para la
+  // administración. El detalle y las imágenes los filtra el servicio (dueño/ámbito).
+  [/^\/manufacturing\/products\/(mine|approved)\/?$/, ["fabricante"]],
+  [/^\/manufacturing\/products\/[^/]+\/expiry-preview\/?$/, ["fabricante"]],
+  [/^\/manufacturing\/products\/(summary\/?)?$/, ADMINS],
+  [/^\/auth\/admins(\/|$)/, MASTER],
+  [/^\/auth\/users(\/|$)/, ADMINS],
+  [/^\/auth\/audit(\/|$)/, ADMINS], // 2.8: registro de auditoría (2.10: admin solo su ámbito)
+  // 2.7 (M1): alertas de fraude, analítica y plantillas solo para la administración.
+  [/^\/fraud(\/|$)/, ADMINS],
+  [/^\/analytics\/reports(\/|$)/, ADMINS],
+  [/^\/analytics(\/|$)/, MASTER], // contadores globales de la plataforma
+  [/^\/notifications\/templates(\/|$)/, ADMINS],
 ];
 
 async function authorize(req, res, next) {
@@ -311,6 +363,7 @@ route("/fraud", "fraud");
 route("/recall", "recall");
 route("/notifications", "notification");
 route("/analytics", "analytics");
+route("/chat", "communication");
 
 app.use((_req, res) => res.status(404).json({ error: "Ruta no encontrada" }));
 app.use((err, _req, res, next) => {
