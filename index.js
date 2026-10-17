@@ -274,6 +274,10 @@ const WRITE_RULES = [
   [["POST"], /^\/manufacturing\/products\/?$/, ["fabricante"]],
   [["PUT"], /^\/manufacturing\/products\/[^/]+\/?$/, ["fabricante"]],
   [["POST"], /^\/recall\/recalls\/?$/, ["fabricante", ...ADMINS]],
+  // 3.2: el fabricante despacha sus lotes al distribuidor y quien RECIBE (distribuidor o
+  // veterinaria) confirma la recepción. El servicio comprueba propiedad, custodia y destino.
+  [["POST"], /^\/distribution\/shipments\/?$/, ["fabricante", "distribuidor"]],
+  [["PATCH"], /^\/distribution\/shipments\/[^/]+\/deliver\/?$/, ["fabricante", "distribuidor", "veterinaria"]],
   [["POST", "PATCH"], /^\/distribution\/(shipments|custody-transfers)(\/|$)/, ["distribuidor"]],
   [["POST"], /^\/dispensing\/dispensations\/?$/, ["veterinaria"]],
   [["PATCH"], /^\/fraud\/fraud-alerts\/[^/]+\/?$/, ADMINS],
