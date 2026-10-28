@@ -38,8 +38,8 @@ Infraestructura compartida:
 
 ```
 push a main
-  └─ GitHub Actions «ci»: npm ci → node --check → docker build → contenedor + /health
-  └─ Render: build de la imagen → deploy → health check del servicio
+  └─ 1. GitHub Actions «ci»: npm ci → node --check → docker build → contenedor + /health
+  └─ 2. Render (solo si los checks pasaron): build de la imagen → deploy → /health
 ```
 
 El workflow `ci` de cada repositorio:
@@ -75,18 +75,23 @@ curl -s -o /dev/null -w "%{http_code}\n" https://vc26-traceability.onrender.com/
 Resultado esperado: todos los servicios en `ok`, gateway `200`, CORS permitido,
 origen ajeno sin cabecera `Access-Control-Allow-Origin`, servicio directo `401`.
 
-## 4. Configuración pendiente en el dashboard de Render (una sola vez)
+## 4. Configuración de Render
 
-`render.yaml` no modifica servicios creados desde el dashboard: solo aplica al adoptar
-el repositorio como Blueprint. Mientras tanto, aplicar a mano en **cada servicio web**:
+Aplicada en los 12 servicios (2026-10-28):
 
-1. **Settings → Health Check Path**: `/health`.
-2. **Settings → Auto-Deploy**: `On Commit` (ya está).
+1. **Health Check Path**: `/health` en los 11 servicios web. Render solo marca el
+   deploy como `live` cuando `/health` responde `200`; si no, falla y conserva la
+   versión anterior.
+2. **Auto-Deploy**: `After CI Checks Pass` (`autoDeployTrigger: checksPass`). Render no
+   despliega hasta que los checks de GitHub del commit estén en verde.
+
+Pendiente, solo por dashboard (la API no lo acepta):
+
 3. **Settings → Notify on Fail**: activar el correo del responsable.
 
-Sin `healthCheckPath`, Render considera exitoso un deploy con solo el contenedor
-arrancado. Con él, un servicio que no responde `/health` se marca como fallido y Render
-conserva la versión anterior.
+`render.yaml` no modifica servicios creados desde el dashboard: solo aplica al adoptar
+el repositorio como Blueprint. Ya refleja esta configuración, así que una adopción
+futura no la revierte.
 
 > Advertencia sobre Blueprints: adoptar `render.yaml` crea servicios **nuevos**. No
 > hacerlo sobre los actuales sin planificar la migración de variables y el cambio de
@@ -137,19 +142,29 @@ Auth: `DATABASE_URL`, `JWT_SECRET`, `SEED_DEMO_USERS=false` en producción. Ver
   snapshot manual antes de cada migración y uno semanal como mínimo.
 - Existe un snapshot base: `manual-baseline-2026-10-28`.
 
-## 8. Gate de producción (recomendado)
+## 8. Gate de producción
 
-Hoy Render despliega en cada push a `main`, en paralelo con CI: un commit roto puede
-llegar a producción aunque CI marque rojo (Render conserva la versión anterior solo si
-el build falla, no si el servicio arranca pero está mal). Para que CI bloquee de verdad:
+Activo desde 2026-10-28. Un push a `main` sigue este orden:
 
-- **Opción A (GitHub Pro)**: proteger `main` con el check `verify` obligatorio y PR
-  obligatorio. En repos privados, la protección de ramas requiere GitHub Pro.
-- **Opción B (sin costo)**: desactivar *Auto-Deploy* en Render y crear un *Deploy Hook*
-  por servicio; el workflow `ci` lo invoca solo en `main` y solo si `verify` pasó,
-  guardando la URL del hook en un secreto `RENDER_DEPLOY_HOOK`.
+```
+push → GitHub Actions «ci» (job verify)
+     → si verify falla: Render NO despliega (el servicio queda con la versión anterior)
+     → si verify pasa: Render construye y despliega, y exige 200 en /health
+```
 
-Mientras no se aplique ninguna, usar PR + revisión del estado de CI antes de mergear.
+Validado con un commit real en `traceability`: durante los 30 s que tardó CI, Render no
+creó ningún deploy; al pasar los checks, arrancó el build y quedó `live`.
+
+Consecuencias operativas:
+
+- **Todo commit a `main` debe generar checks.** El workflow no tiene filtros de rutas,
+  así que cualquier cambio los genera. No agregar `paths:` al workflow o los commits
+  que no lo disparen se desplegarían sin verificación.
+- Si CI se cae por infraestructura (no por código), el deploy queda esperando; re-ejecutar
+  el workflow (`Re-run jobs`) destraba el despliegue sin tocar código.
+- El gate no impide pushear directo a `main`: impide que ese push llegue a producción
+  sin CI en verde. Para revisión obligatoria por PR hace falta GitHub Pro (la protección
+  de ramas en repos privados es de plan pago).
 
 ## 9. Servicios obsoletos (eliminar)
 
