@@ -1,0 +1,46 @@
+# Infraestructura como codigo (Render Blueprint).
+# Los servicios actuales se crearon desde el dashboard: este archivo documenta la
+# configuracion esperada y permite recrear el servicio en otra cuenta/entorno.
+# No modifica el servicio existente hasta que se adopte explicitamente como Blueprint.
+services:
+  - type: web
+    name: vc26-gateway
+    runtime: docker
+    plan: free
+    region: oregon
+    branch: main
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: CORS_ORIGIN
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: AUTH_SERVICE_URL
+        sync: false
+      - key: MANUFACTURING_URL
+        sync: false
+      - key: DISTRIBUTION_URL
+        sync: false
+      - key: TRACEABILITY_URL
+        sync: false
+      - key: DISPENSING_URL
+        sync: false
+      - key: FRAUD_URL
+        sync: false
+      - key: RECALL_URL
+        sync: false
+      - key: NOTIFICATION_URL
+        sync: false
+      - key: ANALYTICS_URL
+        sync: false
+      - key: COMMUNICATION_URL
+        sync: false
+      - key: TRUST_PROXY
+        value: "1"
+      - key: PROXY_TIMEOUT_MS
+        value: "60000"
+      - key: WAKE_TIMEOUT_MS
+        value: "60000"
